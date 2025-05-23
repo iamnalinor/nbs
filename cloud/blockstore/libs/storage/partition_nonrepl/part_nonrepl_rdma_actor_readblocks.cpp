@@ -25,7 +25,8 @@ namespace {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-class TRdmaRequestReadBlocksHandler final: public IRdmaDeviceRequestHandler
+class TRdmaRequestReadBlocksHandler final
+    : public TRdmaDeviceRequestHandlerBase<TRdmaRequestReadBlocksHandler>
 {
 private:
     const bool CheckVoidBlocks;
@@ -33,6 +34,9 @@ private:
     ui32 VoidBlockCount = 0;
 
 public:
+    using TRequestContext = TDeviceReadRequestContext;
+    using TResponseProto = NProto::TReadDeviceBlocksResponse;
+
     TRdmaRequestReadBlocksHandler(
             TActorSystem* actorSystem,
             TNonreplicatedPartitionConfigPtr partConfig,
@@ -42,7 +46,7 @@ public:
             NActors::TActorId parentActorId,
             ui64 requestId,
             bool checkVoidBlocks)
-        : IRdmaDeviceRequestHandler(
+        : TRdmaDeviceRequestHandlerBase(
               actorSystem,
               std::move(partConfig),
               std::move(requestInfo),
@@ -61,40 +65,27 @@ public:
         }
     }
 
-protected:
-    NProto::TError ProcessSubResponse(
-        const TDeviceRequestRdmaContext& reqCtx,
-        TStringBuf buffer) override
+    NProto::TError ProcessSubResponseProto(
+        const TRequestContext& ctx,
+        TResponseProto& proto,
+        TStringBuf data)
     {
-        const auto& readReqCtx =
-            static_cast<const TDeviceReadRequestContext&>(reqCtx);
-        auto* serializer = TBlockStoreProtocol::Serializer();
-        auto [result, err] = serializer->Parse(buffer);
-
-        if (HasError(err)) {
-            return err;
-        }
-
-        const auto& concreteProto =
-            static_cast<NProto::TReadDeviceBlocksResponse&>(*result.Proto);
-        if (HasError(concreteProto.GetError())) {
-            return concreteProto.GetError();
-        }
+        Y_UNUSED(proto);
 
         auto& blocks = *Response.MutableBlocks()->MutableBuffers();
 
         ui64 offset = 0;
         ui64 b = 0;
         bool isAllZeroes = CheckVoidBlocks;
-        while (offset < result.Data.size()) {
-            ui64 targetBlock = readReqCtx.StartIndexOffset + b;
+        while (offset < data.size()) {
+            ui64 targetBlock = ctx.StartIndexOffset + b;
             Y_ABORT_UNLESS(targetBlock < static_cast<ui64>(blocks.size()));
             ui64 bytes =
-                Min(result.Data.size() - offset, blocks[targetBlock].size());
+                Min(data.size() - offset, blocks[targetBlock].size());
             Y_ABORT_UNLESS(bytes);
 
             char* dst = const_cast<char*>(blocks[targetBlock].data());
-            const char* src = result.Data.data() + offset;
+            const char* src = data.data() + offset;
 
             if (isAllZeroes) {
                 isAllZeroes = IsAllZeroes(src, bytes);
@@ -106,19 +97,19 @@ protected:
         }
 
         if (isAllZeroes) {
-            VoidBlockCount += readReqCtx.BlockCount;
+            VoidBlockCount += ctx.BlockCount;
         }
 
         return {};
     }
 
-    std::unique_ptr<IEventBase> CreateCompletionEvent() override
+    auto CreateCompletionEvent(const NProto::TError& error)
     {
         const ui32 blockCount = GetRequestBlockCount();
         const bool allZeroes = VoidBlockCount == blockCount;
 
-        auto completion = CreateConcreteCompletionEvent<
-            TEvNonreplPartitionPrivate::TEvReadBlocksCompleted>();
+        auto completion = std::make_unique<
+            TEvNonreplPartitionPrivate::TEvReadBlocksCompleted>(error);
 
         completion->NonVoidBlockCount = allZeroes ? 0 : blockCount;
         completion->VoidBlockCount = allZeroes ? blockCount : 0;
@@ -128,7 +119,7 @@ protected:
         return completion;
     }
 
-    std::unique_ptr<IEventBase> CreateResponse(NProto::TError error) override
+    std::unique_ptr<IEventBase> CreateResponse(NProto::TError error)
     {
         const ui32 blockCount = Response.GetBlocks().BuffersSize();
         const bool allZeroes = VoidBlockCount == blockCount;
