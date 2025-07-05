@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"reflect"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -89,6 +90,10 @@ func StructFieldValue(name string, v Value) ydb_types.StructValueOption {
 
 func StructValue(opts ...ydb_types.StructValueOption) Value {
 	return ydb_types.StructValue(opts...)
+}
+
+func NewTTLSettings() ydb_options.TimeToLiveSettings {
+	return ydb_options.NewTTLSettings()
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -206,6 +211,7 @@ type CreateTableDescription struct {
 	ColumnFamilies         []ydb_options.ColumnFamily
 	UniformPartitions      uint64
 	ExternalBlobsMediaKind string
+	TimeToLiveSettings     *ydb_options.TimeToLiveSettings
 }
 
 type CreateTableOption func(*CreateTableDescription)
@@ -256,6 +262,12 @@ func WithUniformPartitions(n uint64) CreateTableOption {
 func WithExternalBlobs(mediaKind string) CreateTableOption {
 	return func(d *CreateTableDescription) {
 		d.ExternalBlobsMediaKind = mediaKind
+	}
+}
+
+func WithTTLSettings(settings ydb_options.TimeToLiveSettings) CreateTableOption {
+	return func(d *CreateTableDescription) {
+		d.TimeToLiveSettings = &settings
 	}
 }
 
@@ -872,6 +884,10 @@ func createTable(
 		))
 	}
 
+	if description.TimeToLiveSettings != nil {
+		options = append(options, ydb_options.WithTimeToLiveSettings(*description.TimeToLiveSettings))
+	}
+
 	return session.CreateTable(ctx, fullPath, options...)
 }
 
@@ -961,10 +977,6 @@ func alterTable(
 		return err
 	}
 
-	if len(addedColumns) == 0 {
-		return nil
-	}
-
 	alterTableOptions := make([]ydb_options.AlterTableOption, 0)
 
 	for _, column := range addedColumns {
@@ -975,6 +987,37 @@ func alterTable(
 		for _, column := range unusedColumns {
 			alterTableOptions = append(alterTableOptions, ydb_options.WithDropColumn(column.Name))
 		}
+	}
+
+	currentTtlSettings := currentDescription.TimeToLiveSettings
+	ttlSettings := description.TimeToLiveSettings
+	if !reflect.DeepEqual(currentTtlSettings, ttlSettings) {
+		if ttlSettings == nil {
+			alterTableOptions = append(alterTableOptions, ydb_options.WithDropTimeToLive())
+		} else {
+			// TTL columns cannot be deleted unless TTL for this column in disabled first
+			dropTtlFirst := false
+			if currentTtlSettings != nil && currentTtlSettings.ColumnName != ttlSettings.ColumnName && dropUnusedColumns {
+				for _, column := range unusedColumns {
+					if column.Name == currentTtlSettings.ColumnName {
+						dropTtlFirst = true
+						break
+					}
+				}
+			}
+			if dropTtlFirst {
+				err := session.AlterTable(ctx, fullPath, ydb_options.WithDropTimeToLive())
+				if err != nil {
+					return err
+				}
+			}
+
+			alterTableOptions = append(alterTableOptions, ydb_options.WithSetTimeToLiveSettings(*ttlSettings))
+		}
+	}
+
+	if len(alterTableOptions) == 0 {
+		return nil
 	}
 
 	return session.AlterTable(ctx, fullPath, alterTableOptions...)
